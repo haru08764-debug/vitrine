@@ -109,34 +109,56 @@ int main(void) {
         CHECK(!readFrom(@"anthropic", @"{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}", 529, 2, &problem) && [problem containsString:@"busy"]);
 
         // The requests: where each goes, the key in its header and never in the body, and what plain leaves out.
-        NSURLRequest *gemini = SGAITranslationRequest(@"gemini", @"gemini-3.6-flash", @"P", @"k1", NO);
+        NSURLRequest *gemini = SGAITranslationRequest(@"gemini", @"gemini-3.6-flash", @"P", nil, nil, @"k1", NO);
         CHECK([gemini.URL.absoluteString isEqualToString:@"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"]);
         CHECK([[gemini valueForHTTPHeaderField:@"x-goog-api-key"] isEqualToString:@"k1"] && bodyOf(gemini)[@"generationConfig"][@"thinkingConfig"]);
-        CHECK(!bodyOf(SGAITranslationRequest(@"gemini", @"gemini-3.6-flash", @"P", @"k1", YES))[@"generationConfig"][@"thinkingConfig"]);
-        NSURLRequest *chat = SGAITranslationRequest(@"openai", @"gpt-6-astra", @"P", @"k2", NO);
+        CHECK(!bodyOf(SGAITranslationRequest(@"gemini", @"gemini-3.6-flash", @"P", nil, nil, @"k1", YES))[@"generationConfig"][@"thinkingConfig"]);
+        NSURLRequest *chat = SGAITranslationRequest(@"openai", @"gpt-6-astra", @"P", nil, nil, @"k2", NO);
         CHECK([chat.URL.absoluteString isEqualToString:@"https://api.openai.com/v1/chat/completions"]);
         CHECK([[chat valueForHTTPHeaderField:@"Authorization"] isEqualToString:@"Bearer k2"]);
         CHECK([bodyOf(chat)[@"model"] isEqualToString:@"gpt-6-astra"] && [bodyOf(chat)[@"messages"][0][@"content"] isEqualToString:@"P"]);
         CHECK([bodyOf(chat)[@"response_format"][@"json_schema"][@"strict"] boolValue]
               && [bodyOf(chat)[@"response_format"][@"json_schema"][@"schema"][@"required"] isEqualToArray:(@[@"lines"])]);
-        NSDictionary *plainChat = bodyOf(SGAITranslationRequest(@"openai", @"gpt-6-astra", @"P", @"k2", YES));
+        NSDictionary *plainChat = bodyOf(SGAITranslationRequest(@"openai", @"gpt-6-astra", @"P", nil, nil, @"k2", YES));
         CHECK(!plainChat[@"response_format"] && !plainChat[@"reasoning_effort"] && plainChat[@"messages"]);
         // A server of the user's own, kept in the Keychain beside its key: a pasted /chat/completions is not
         // doubled, a URL that could carry a secret is not used at all (and not swapped for OpenAI's), and a server
         // in the settings, as an imported settings file could hold, is never read.
         [NSUserDefaults.standardUserDefaults setObject:@"https://attacker.example/v1" forKey:@"spotifyglass.lyrics.openai.url"];
-        CHECK([SGAITranslationRequest(@"openai", @"x", @"P", @"k", NO).URL.host isEqualToString:@"api.openai.com"]);
+        CHECK([SGAITranslationRequest(@"openai", @"x", @"P", nil, nil, @"k", NO).URL.host isEqualToString:@"api.openai.com"]);
         [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.lyrics.openai.url"];
         CHECK([SGAIServerIn(@"http://192.168.1.5:11434/v1/chat/completions") isEqualToString:@"http://192.168.1.5:11434/v1"]);
         CHECK(!SGAIServerIn(@"https://openrouter.ai/api/v1?key=secret") && !SGAIServerIn(@"https://u:p@example.com/v1"));
         CHECK(!SGAIServerIn(@"ftp://example.com") && !SGAIServerIn(@""));
-        NSURLRequest *messages = SGAITranslationRequest(@"anthropic", @"claude-haiku-5-5", @"P", @"k3", NO);
+        NSURLRequest *messages = SGAITranslationRequest(@"anthropic", @"claude-haiku-5-5", @"P", nil, nil, @"k3", NO);
         CHECK([messages.URL.absoluteString isEqualToString:@"https://api.anthropic.com/v1/messages"]);
         CHECK([[messages valueForHTTPHeaderField:@"x-api-key"] isEqualToString:@"k3"] && [messages valueForHTTPHeaderField:@"anthropic-version"]);
         CHECK([bodyOf(messages)[@"max_tokens"] integerValue] > 0 && [bodyOf(messages)[@"output_config"][@"format"][@"type"] isEqualToString:@"json_schema"]);
-        CHECK(!bodyOf(SGAITranslationRequest(@"anthropic", @"claude-haiku-5-5", @"P", @"k3", YES))[@"output_config"]);
+        CHECK(!bodyOf(SGAITranslationRequest(@"anthropic", @"claude-haiku-5-5", @"P", nil, nil, @"k3", YES))[@"output_config"]);
         CHECK(![[[NSString alloc] initWithData:messages.HTTPBody encoding:NSUTF8StringEncoding] containsString:@"k3"]);
-        CHECK(!SGAITranslationRequest(@"nobody", @"m", @"P", @"k", NO));
+        CHECK(!SGAITranslationRequest(@"nobody", @"m", @"P", nil, nil, @"k", NO));
+        // Google Translate: the lines and their language themselves, the key in the header and never in the body, and
+        // its answer's translations read as one line each.
+        NSURLRequest *cloud = SGAITranslationRequest(@"google", @"nmt", nil, @[@"Hola", @""], @"zh-Hant", @"k4", NO);
+        CHECK([cloud.URL.absoluteString isEqualToString:@"https://translation.googleapis.com/language/translate/v2"]);
+        CHECK([[cloud valueForHTTPHeaderField:@"X-Goog-Api-Key"] isEqualToString:@"k4"]);
+        CHECK([bodyOf(cloud)[@"q"] isEqualToArray:(@[@"Hola", @""])] && [bodyOf(cloud)[@"target"] isEqualToString:@"zh-TW"]
+              && [bodyOf(cloud)[@"format"] isEqualToString:@"text"]);
+        CHECK([bodyOf(SGAITranslationRequest(@"google", @"nmt", nil, @[@"Hola"], @"en-US", @"k", NO))[@"target"] isEqualToString:@"en"]);
+        CHECK([bodyOf(SGAITranslationRequest(@"google", @"nmt", nil, @[@"Hola"], @"zh-Hans", @"k", NO))[@"target"] isEqualToString:@"zh-CN"]);
+        CHECK([bodyOf(SGAITranslationRequest(@"google", @"nmt", nil, @[@"Hola"], @"nb", @"k", NO))[@"target"] isEqualToString:@"no"]);
+        CHECK(![[[NSString alloc] initWithData:cloud.HTTPBody encoding:NSUTF8StringEncoding] containsString:@"k4"]);
+        CHECK([readFrom(@"google", @"{\"data\":{\"translations\":[{\"translatedText\":\"Hello\"},{\"translatedText\":\"It&#39;s\"}]}}", 200, 2, &problem)
+               isEqualToArray:(@[@"Hello", @"It's"])] && !problem);
+        CHECK(!readFrom(@"google", @"{\"data\":{\"translations\":[{\"translatedText\":\"Hello\"}]}}", 200, 2, &problem) && [problem containsString:@"1 lines"]);
+        CHECK(!readFrom(@"google", @"{\"error\":{\"code\":403,\"message\":\"The request is missing a valid API key.\"}}", 403, 2, &problem)
+              && [problem isEqualToString:@"Google Translate turned the key down. Check it on the Lyrics page."]);
+        CHECK(!readFrom(@"google", @"{}", 200, 2, &problem) && [problem containsString:@"could not be read"]);
+        // Its rows and what a saved translation is named: no model to name, and the provider is Google Translate.
+        [NSUserDefaults.standardUserDefaults setObject:@"google" forKey:SGKeyAITranslator];
+        CHECK([SGAITranslatorName() isEqualToString:@"Google Translate"] && [SGAITranslatorRecipient() isEqualToString:@"Google"]);
+        CHECK([[SGAITranslatorSource() name] isEqualToString:@"Google Translate"]);
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:SGKeyAITranslator];
 
         // Saved files: the new shape with its source, and one from before sources were kept, as unknown.
         SGTranslationSource *source = nil;

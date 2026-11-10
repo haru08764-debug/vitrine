@@ -1,7 +1,7 @@
-// A song's lines translated into any language by an AI translator on the user's own API key (Gemini, an
-// OpenAI-compatible server, or Anthropic), at a tap in the lyrics' corner menu. Each key lives in the Keychain,
-// not in the settings, so a settings export never carries it. Only the lyrics' text and the language go out,
-// to the chosen provider.
+// A song's lines translated into any language by a translator on the user's own API key (Gemini, Google
+// Translate, an OpenAI-compatible server, or Anthropic), at a tap in the lyrics' corner menu. Each key lives in
+// the Keychain, not in the settings, so a settings export never carries it. Only the lyrics' text and the
+// language go out, to the chosen provider.
 #import <UIKit/UIKit.h>
 
 @class SGKaraokeLine, SGModRow;
@@ -19,9 +19,11 @@ SGModRow *SGTranslateEverySongRow(void);
 #define SGKeyLyricsAppleIntelligence @"spotifyglass.lyrics.appleIntelligence"
 NSArray<SGModRow *> *SGOnDeviceTranslatorRows(void);
 
-// The AI translator: a provider's id (gemini, openai, anthropic; unset: gemini), the prompt every provider gets
-// (unset: Vitrine's), and per provider spotifyglass.lyrics.<id>.model. An OpenAI-compatible server (unset: OpenAI's)
-// is kept in the Keychain beside its key, not here. All read at each translation.
+// The AI translator: a provider's id (gemini, google, openai, anthropic; unset: gemini), the prompt the
+// conversation models get (unset: Vitrine's), and per provider spotifyglass.lyrics.<id>.model. An
+// OpenAI-compatible server (unset: OpenAI's) is kept in the Keychain beside its key, not here. All read at each
+// translation. Google Translate is Cloud Translation, which takes the lines and the language themselves: no
+// prompt, no model to pick, so its two rows are the provider and its key.
 #define SGKeyAITranslator @"spotifyglass.lyrics.ai"
 #define SGKeyAIPrompt @"spotifyglass.lyrics.prompt"
 
@@ -33,7 +35,7 @@ NSArray<SGModRow *> *SGOnDeviceTranslatorRows(void);
 @property (nonatomic, copy, readonly) NSString *by, *model;
 @property (nonatomic, readonly) NSDate *made;   // nil: not known
 + (instancetype)by:(NSString *)by model:(NSString *)model made:(NSDate *)made;
-@property (nonatomic, readonly) NSString *name;   // "Gemini (gemini-3.6-flash)", "Translate on iPhone", "Unknown"
+@property (nonatomic, readonly) NSString *name;   // "Gemini (gemini-3.6-flash)", "Google Translate", "Translate on iPhone", "Unknown"
 @property (nonatomic, readonly) BOOL deletable;   // made by an AI provider, or by no one known
 @end
 
@@ -41,7 +43,8 @@ NSArray<SGModRow *> *SGOnDeviceTranslatorRows(void);
 BOOL SGAITranslatorReady(void);
 // Removes every provider's key and the OpenAI-compatible server from the Keychain (Mod > Clear Keychain).
 void SGAIForgetKeys(void);
-// The menu item's words: "Gemini", "Anthropic", or an OpenAI-compatible server's model; and who gets the lyrics.
+// The menu item's words: "Gemini", "Google Translate", "Anthropic", or an OpenAI-compatible server's model; and who
+// gets the lyrics.
 NSString *SGAITranslatorName(void);
 NSString *SGAITranslatorRecipient(void);
 // The provider and model a translation asked now is made by.
@@ -60,9 +63,11 @@ NSString *SGLyricsSongName(NSString *trackID);
 // The language a translation is asked in: the Lyrics page's, else the phone's own.
 NSString *SGLyricsTranslationTarget(void);
 
-// The request a provider is sent, plain being the one without the optional fields some models turn down.
-// nil for an unknown provider or a server URL that is not usable.
-NSURLRequest *SGAITranslationRequest(NSString *provider, NSString *model, NSString *prompt, NSString *key, BOOL plain);
+// The request a provider is sent, plain being the one without the optional fields some models turn down. A
+// conversation model gets the prompt, the lines already in it; Google Translate gets the lines and their language
+// themselves. nil for an unknown provider or a server URL that is not usable.
+NSURLRequest *SGAITranslationRequest(NSString *provider, NSString *model, NSString *prompt, NSArray<NSString *> *lines,
+                                     NSString *languageTag, NSString *key, BOOL plain);
 // An OpenAI-compatible server URL as typed: nil when it is not http(s) with a host or could carry a secret.
 NSString *SGAIServerIn(NSString *text);
 // A provider's reply read: one translation per line when it has exactly `count`, else nil and in `problem`

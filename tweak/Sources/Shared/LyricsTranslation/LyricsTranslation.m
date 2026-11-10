@@ -32,9 +32,14 @@ typedef struct {
     BOOL modelInURL;   // the id goes into the URL's path, so only the characters of an id are let through
     // Words of a 400 that send the plain request instead: the optional fields a model may not know.
     __unsafe_unretained NSString *plainWhen[4];
-    NSMutableURLRequest *(*request)(NSString *model, NSString *prompt, NSString *key, BOOL plain);
+    // model and prompt for a conversation model; lines and their language for one that translates them itself.
+    NSMutableURLRequest *(*request)(NSString *model, NSString *prompt, NSArray<NSString *> *lines, NSString *languageTag,
+                                    NSString *key, BOOL plain);
     // The answer's text, or nil and in `stopped` why the model stopped short.
     NSString *(*answer)(NSDictionary *reply, NSString *speaker, NSString **stopped);
+    // A translator that takes the lines themselves (Google Translate): this many lines a request, so a long song is
+    // asked a batch at a time. 0 for a conversation model, asked once with the whole prompt.
+    NSUInteger segments;
 } SGAIProvider;
 
 static NSString *filtered(NSString *speaker) { return [NSString stringWithFormat:@"%@'s filters blocked this song's lyrics.", speaker]; }
@@ -71,7 +76,8 @@ static NSDictionary *linesSchema(void) {
 }
 
 // Gemini: generateContent, the key in x-goog-api-key, a bare array forced by responseSchema.
-static NSMutableURLRequest *geminiRequest(NSString *model, NSString *prompt, NSString *key, BOOL plain) {
+static NSMutableURLRequest *geminiRequest(NSString *model, NSString *prompt, NSArray<NSString *> *lines, NSString *languageTag,
+                                          NSString *key, BOOL plain) {
     // Lyrics are often explicit, and translating them is what the user asked for, so every filter that can
     // be lowered is. Recitation cannot be switched off, and is named when it stops an answer.
     NSMutableArray *safety = [NSMutableArray array];
@@ -132,7 +138,8 @@ static NSString *openAIServer(void) {
 
 // OpenAI-compatible: chat completions with a bearer key, the lines forced into {"lines": [...]} by a strict
 // schema. Plain: no schema and no reasoning effort, for servers and models that take neither.
-static NSMutableURLRequest *openAIRequest(NSString *model, NSString *prompt, NSString *key, BOOL plain) {
+static NSMutableURLRequest *openAIRequest(NSString *model, NSString *prompt, NSArray<NSString *> *lines, NSString *languageTag,
+                                          NSString *key, BOOL plain) {
     NSString *server = openAIServer();
     NSMutableDictionary *body = [@{@"model": model, @"messages": @[@{@"role": @"user", @"content": prompt}]} mutableCopy];
     if (!plain) {
@@ -156,7 +163,8 @@ static NSString *openAIAnswer(NSDictionary *reply, NSString *speaker, NSString *
 // Anthropic: the Messages API, the lines forced by output_config.format, thinking kept short by a low effort.
 // max_tokens is required; output is billed as made, so a high cap costs nothing. Plain: without output_config,
 // for a model that knows neither field.
-static NSMutableURLRequest *anthropicRequest(NSString *model, NSString *prompt, NSString *key, BOOL plain) {
+static NSMutableURLRequest *anthropicRequest(NSString *model, NSString *prompt, NSArray<NSString *> *lines, NSString *languageTag,
+                                             NSString *key, BOOL plain) {
     NSMutableDictionary *body = [@{@"model": model, @"max_tokens": @16000,
                                    @"messages": @[@{@"role": @"user", @"content": prompt}]} mutableCopy];
     if (!plain) body[@"output_config"] = @{@"effort": @"low", @"format": @{@"type": @"json_schema", @"schema": linesSchema()}};
@@ -179,6 +187,53 @@ static NSString *anthropicAnswer(NSDictionary *reply, NSString *speaker, NSStrin
     return text.length ? text : nil;
 }
 
+// Google Translate is Cloud Translation, which is the lines themselves and their language and nothing else: one
+// translation a line back, in the same order. No prompt and no model to pick, so nothing optional is sent and there
+// is no plain request; the key goes in the header every googleapis call takes it in, never in the URL.
+static NSString *googleLanguage(NSString *tag) {
+    // The API's own codes: Chinese by its script, Bokmål as no (the API's Norwegian), and no region for the rest
+    // (en-US is en).
+    NSString *lower = tag.lowercaseString;
+    if ([lower hasPrefix:@"zh"]) {
+        return [lower containsString:@"hant"] || [lower containsString:@"tw"] || [lower containsString:@"hk"] ? @"zh-TW" : @"zh-CN";
+    }
+    if ([lower hasPrefix:@"nb"]) return @"no";
+    NSRange region = [lower rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]];
+    return region.location == NSNotFound ? lower : [lower substringToIndex:region.location];
+}
+
+static NSMutableURLRequest *googleRequest(NSString *model, NSString *prompt, NSArray<NSString *> *lines, NSString *languageTag,
+                                          NSString *key, BOOL plain) {
+    // format text, so a line's apostrophe comes back as one rather than as &#39;.
+    NSMutableURLRequest *request = post(@"https://translation.googleapis.com/language/translate/v2",
+                                        @{@"q": lines ?: @[], @"target": googleLanguage(languageTag ?: @"en"), @"format": @"text"});
+    [request setValue:key forHTTPHeaderField:@"X-Goog-Api-Key"];
+    return request;
+}
+
+// What its HTML format would escape, put back in case a line arrives escaped all the same; &amp; last, so a
+// literal &amp;#39; stays one.
+static NSString *unescaped(NSString *text) {
+    static NSArray<NSArray<NSString *> *> *entities;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        entities = @[@[@"&lt;", @"<"], @[@"&gt;", @">"], @[@"&quot;", @"\""], @[@"&#39;", @"'"], @[@"&apos;", @"'"],
+                     @[@"&#x27;", @"'"], @[@"&amp;", @"&"]];
+    });
+    for (NSArray<NSString *> *entity in entities) text = [text stringByReplacingOccurrencesOfString:entity[0] withString:entity[1]];
+    return text;
+}
+
+// {"data": {"translations": [{"translatedText": ...}, ...]}}, in the lines' order, handed on as the JSON array of
+// strings a model's answer is read as.
+static NSString *googleAnswer(NSDictionary *reply, NSString *speaker, NSString **stopped) {
+    id translations = dig(reply, @[@"data", @"translations"]);
+    if (![translations isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithCapacity:[translations count]];
+    for (id entry in translations) [lines addObject:unescaped(string(dig(entry, @[@"translatedText"])) ?: @"")];
+    return [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:lines options:0 error:nil] encoding:NSUTF8StringEncoding];
+}
+
 static const SGAIProvider kProviders[] = {
     {@"gemini", @"Gemini", @"Google", @"Vitrine.Gemini",
      @"Translate with Gemini sends the song's lyrics to Google, on your own key from Google AI Studio. The key stays on this iPhone.",
@@ -186,13 +241,19 @@ static const SGAIProvider kProviders[] = {
      // A pinned id first, the one users report working. gemini-flash-latest follows each Flash release, preview
      // ones included, with notice only by email to the key's owner, so it is offered but not the default.
      {@"gemini-3.6-flash", @"gemini-3.5-flash-lite", @"gemini-flash-latest"}, {@"3.6 Flash", @"3.5 Flash-Lite", @"Flash (latest)"},
-     YES, {@"thinking"}, geminiRequest, geminiAnswer},
+     YES, {@"thinking"}, geminiRequest, geminiAnswer, 0},
+    {@"google", @"Google Translate", @"Google", @"Vitrine.Google",
+     @"Translate with Google Translate sends the song's lyrics to Google Cloud Translation, on your own API key from "
+     @"the Google Cloud Console (500,000 characters a month are free). The key stays on this iPhone.",
+     @"",   // no prompt: the lines and their language are the whole request
+     // No model to pick: the API's default one, named only so the provider reads as set up.
+     {@"nmt"}, {@"Neural (nmt)"}, NO, {nil}, googleRequest, googleAnswer, 100},
     {@"openai", @"OpenAI-compatible", nil, @"Vitrine.OpenAI",
      @"Sends the song's lyrics to the server below: OpenAI's own unless you name another, such as OpenRouter, or an "
      @"Ollama on your network (http works for local addresses). The key stays on this iPhone; for a server without "
      @"keys, copy any word and paste that.",
      kLinesFormat,
-     {nil}, {nil}, NO, {@"response_format", @"json_schema", @"reasoning"}, openAIRequest, openAIAnswer},
+     {nil}, {nil}, NO, {@"response_format", @"json_schema", @"reasoning"}, openAIRequest, openAIAnswer, 0},
     {@"anthropic", @"Anthropic", @"Anthropic", @"Vitrine.Anthropic",
      @"Translate with Anthropic sends the song's lyrics to Anthropic, on your own key from the Claude Console. The key stays on this iPhone.",
      kLinesFormat,
@@ -200,7 +261,7 @@ static const SGAIProvider kProviders[] = {
      // whose safety classifiers stop at lyrics with a refusal; Other… still names any model. Haiku 4.5 has no
      // effort, so its first request comes back once and is sent plain.
      {@"claude-haiku-4-5", @"claude-sonnet-4-6"}, {@"Haiku 4.5", @"Sonnet 4.6"},
-     NO, {@"output_config", @"effort", @"json_schema"}, anthropicRequest, anthropicAnswer},
+     NO, {@"output_config", @"effort", @"json_schema"}, anthropicRequest, anthropicAnswer, 0},
 };
 static const NSUInteger kProviderCount = sizeof(kProviders) / sizeof(kProviders[0]);
 
@@ -312,7 +373,8 @@ NSString *SGAITranslatorRecipient(void) {
 
 SGTranslationSource *SGAITranslatorSource(void) {
     const SGAIProvider *p = chosen();
-    return [SGTranslationSource by:p->tag model:model(p) made:nil];
+    // Google Translate has no model to name, so it is "Google Translate" rather than "Google Translate (nmt)".
+    return [SGTranslationSource by:p->tag model:p->segments ? nil : model(p) made:nil];
 }
 
 @implementation SGTranslationSource
@@ -354,9 +416,10 @@ NSString *SGLyricsTranslationTarget(void) {
     return SGLyricsTranslationLanguage() ?: NSLocale.preferredLanguages.firstObject ?: @"en";
 }
 
-NSURLRequest *SGAITranslationRequest(NSString *provider, NSString *modelID, NSString *prompt, NSString *key, BOOL plain) {
+NSURLRequest *SGAITranslationRequest(NSString *provider, NSString *modelID, NSString *prompt, NSArray<NSString *> *lines,
+                                     NSString *languageTag, NSString *key, BOOL plain) {
     const SGAIProvider *p = providerFor(provider);
-    return p && modelID && key ? p->request(modelID, prompt, key, plain) : nil;
+    return p && (modelID || p->segments) && key ? p->request(modelID, prompt, lines, languageTag, key, plain) : nil;
 }
 
 // The lines out of an answer: a bare array or {"lines": [...]}, whichever the request forced or the prompt asked
@@ -452,6 +515,45 @@ void SGLyricsForgetAITranslation(NSString *trackID, NSString *languageTag) {
     for (NSString *memo in sg_done.allKeys) if ([memo hasPrefix:song]) [sg_done removeObjectForKey:memo];
 }
 
+// A translator that takes the lines themselves is asked a batch at a time: Cloud Translation's request holds 128
+// lines and 30,000 characters, so a song goes 100 lines and 20,000 characters at a time, each answer read into the
+// lines it was asked for and the next batch sent after it. A batch that fails ends the song, and none of it shows:
+// a song's translations show together.
+static void askInBatches(const SGAIProvider *p, NSString *modelID, NSString *key, NSArray<NSString *> *texts,
+                         NSArray<NSNumber *> *wanted, NSString *languageTag, NSUInteger at, NSMutableArray<NSString *> *out,
+                         void (^done)(NSArray<NSString *> *translations, NSString *problem)) {
+    if (at >= wanted.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{ done(out, nil); });
+        return;
+    }
+    NSMutableArray<NSNumber *> *indices = [NSMutableArray array];
+    NSMutableArray<NSString *> *chunk = [NSMutableArray array];
+    NSUInteger characters = 0;
+    for (; at < wanted.count && indices.count < p->segments; at++) {
+        NSString *text = texts[wanted[at].unsignedIntegerValue];
+        if (chunk.count && characters + text.length > 20000) break;
+        characters += text.length;
+        [chunk addObject:text];
+        [indices addObject:wanted[at]];
+    }
+    NSURLRequest *request = p->request(modelID, nil, chunk, languageTag, key, NO);
+    if (!request) {
+        dispatch_async(dispatch_get_main_queue(), ^{ done(nil, @"Google Translate's request could not be made."); });
+        return;
+    }
+    send(p, request, nil, 0, ^(NSData *data, NSInteger status, NSError *error) {
+        id root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSString *problem = nil;
+        NSArray<NSString *> *translations = SGAITranslationsIn(p->tag, root, status, error, chunk.count, &problem);
+        if (!translations) {
+            dispatch_async(dispatch_get_main_queue(), ^{ done(nil, problem); });
+            return;
+        }
+        for (NSUInteger i = 0; i < indices.count; i++) out[indices[i].unsignedIntegerValue] = translations[i];
+        askInBatches(p, modelID, key, texts, wanted, languageTag, at, out, done);
+    });
+}
+
 void SGLyricsTranslateWithAI(NSString *trackID, NSArray<SGKaraokeLine *> *lines, NSString *languageTag,
                              void (^done)(NSArray<NSString *> *translations, NSString *error)) {
     const SGAIProvider *p = chosen();
@@ -469,6 +571,23 @@ void SGLyricsTranslateWithAI(NSString *trackID, NSArray<SGKaraokeLine *> *lines,
     }
     NSMutableArray<NSString *> *texts = [NSMutableArray arrayWithCapacity:lines.count];
     for (SGKaraokeLine *line in lines) [texts addObject:SGKaraokeLineText(line) ?: @""];
+    // A translator that takes the lines themselves: no prompt goes, and a line with no words needs none, so it keeps
+    // its place and only the others are asked, a batch at a time.
+    if (p->segments) {
+        NSMutableArray<NSNumber *> *wanted = [NSMutableArray array];
+        NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:texts.count];
+        for (NSUInteger i = 0; i < texts.count; i++) {
+            if ([texts[i] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length) [wanted addObject:@(i)];
+            [out addObject:@""];
+        }
+        SGLog(@"ai: asking %@ %lu lines into %@", p->tag, (unsigned long)wanted.count, languageTag);
+        askInBatches(p, modelID, key, texts, wanted, languageTag, 0, out, ^(NSArray<NSString *> *translations, NSString *problem) {
+            SGLog(@"ai: %@ %@ lines into %@: %@", p->tag, @(texts.count), languageTag, translations ? @"translated" : problem);
+            if (translations && trackID) sg_done[memo] = translations;
+            done(translations, problem);
+        });
+        return;
+    }
     // By the whole tag, so the script stays: zh-Hant is "Chinese, Traditional" where its language alone is "Chinese".
     NSString *language = [[NSLocale localeWithLocaleIdentifier:@"en"] localizedStringForLocaleIdentifier:languageTag] ?: languageTag;
     NSData *input = [NSJSONSerialization dataWithJSONObject:texts options:0 error:nil];
@@ -478,7 +597,7 @@ void SGLyricsTranslateWithAI(NSString *trackID, NSArray<SGKaraokeLine *> *lines,
     instructions = [[instructions stringByReplacingOccurrencesOfString:@"{language}" withString:language]
                     stringByReplacingOccurrencesOfString:@"{count}" withString:@(texts.count).stringValue];
     NSString *prompt = [NSString stringWithFormat:@"%@\n\n%@", instructions, [[NSString alloc] initWithData:input encoding:NSUTF8StringEncoding]];
-    NSURLRequest *request = p->request(modelID, prompt, key, NO), *plain = p->request(modelID, prompt, key, YES);
+    NSURLRequest *request = p->request(modelID, prompt, nil, nil, key, NO), *plain = p->request(modelID, prompt, nil, nil, key, YES);
     if (!request) {
         done(nil, @"The OpenAI-compatible server's URL is not usable. Check it on the Lyrics page.");
         return;
@@ -717,6 +836,9 @@ NSArray<SGModRow *> *SGAITranslatorRows(void) {
         for (NSUInteger i = 0; i < 4 && p->models[i]; i++) if ([p->models[i] isEqualToString:current]) return p->modelNames[i];
         return current ?: @"Not set";
     }, nil);
+    // Google Translate has no model to pick and no prompt to write: its two rows are the provider and its key, and
+    // these two come back with a conversation model, faded in when one is picked.
+    models.visible = ^BOOL{ return chosen()->segments == 0; };
     __weak SGModRow *weakModels = models;
     models.chosen = ^(NSInteger index) {
         const SGAIProvider *p = chosen();
@@ -744,5 +866,6 @@ NSArray<SGModRow *> *SGAITranslatorRows(void) {
         SGPresentDark(nav);
         [SGTopController() presentViewController:nav animated:YES completion:nil];
     });
+    prompt.visible = models.visible;
     return @[provider, key, models, prompt];
 }
